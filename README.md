@@ -26,7 +26,7 @@
 | `ZAMPTO_SERVER_ID` | 服务器 ID（URL 中的数字，如 `XXXX`）|
 | `WXPUSHER_TOKEN` | WxPusher App Token |
 | `WXPUSHER_UID` | WxPusher 用户 UID |
-| `HY2_CONFIG` | Hysteria2 客户端配置（JSON 格式，见下方说明）|
+| `V2RAY_CONFIG` | V2RAY_CONFIG 客户端配置（JSON 格式，见下方说明）|
 
 ### 3. 获取 Server ID
 
