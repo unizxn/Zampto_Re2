@@ -4,7 +4,7 @@
 import os
 import sys
 import time
-import requests
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 
 # ==================== 配置区 ====================
@@ -46,15 +46,15 @@ def send_wxpusher(title, content):
     }
     
     try:
-        resp = requests.post(url, json=data, timeout=10)
+        # 通知接口通常不需要强指纹，使用普通 requests 即可，若失败可忽略
+        import requests as std_requests
+        resp = std_requests.post(url, json=data, timeout=10)
         if resp.status_code == 200:
             result = resp.json()
             if result.get("code") == 1000:
                 print(f"✅ WxPusher 通知发送成功: {title}")
             else:
                 print(f"❌ WxPusher 通知失败: {result.get('msg')}")
-        else:
-            print(f"❌ WxPusher 请求失败: HTTP {resp.status_code}")
     except Exception as e:
         print(f"❌ WxPusher 异常: {e}")
 
@@ -62,7 +62,8 @@ def send_wxpusher(title, content):
 def check_proxy():
     """检查代理是否正常工作"""
     try:
-        resp = requests.get("https://ifconfig.me", proxies=PROXIES, timeout=10)
+        # 使用 curl_cffi 模拟浏览器检查代理
+        resp = requests.get("https://ifconfig.me", proxies=PROXIES, timeout=10, impersonate="chrome124")
         ip = resp.text.strip()
         print(f"✅ 代理正常，出口 IP: {ip}")
         return True
@@ -77,12 +78,11 @@ def login(session):
     """登录 Zampto"""
     print(f"🔐 正在登录: {ZAMPTO_USERNAME}")
     
-    # 【新增】伪装成真实浏览器，防止被基础反爬虫/WAF拦截
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7'
-    })
+    # 💡 核心技巧：先访问一次首页，让 WAF 下发正常的初始 Cookie，大幅降低被拦截概率
+    try:
+        session.get(f"{BASE_URL}/", proxies=PROXIES, timeout=30)
+    except Exception:
+        pass # 忽略首页访问错误，继续尝试登录页
     
     login_url = f"{BASE_URL}/login"
     try:
@@ -99,13 +99,10 @@ def login(session):
     if not csrf_input:
         print("❌ 未找到 CSRF token")
         print(f"⚠️ HTTP 状态码: {resp.status_code}")
-        print(f"⚠️ 页面内容片段 (前 400 字符): \n{resp.text[:400].strip()}")
+        print(f"⚠️ 页面内容片段 (前 500 字符): \n{resp.text[:500].strip()}")
         
-        # 检查是否被 Cloudflare 等 WAF 拦截
-        if "cloudflare" in resp.text.lower() or "checking your browser" in resp.text.lower() or "ddos" in resp.text.lower():
-            print("⚠️ 检测到可能被 Cloudflare 或 WAF 拦截！")
-            print("💡 建议：请检查你的 SOCKS 代理 IP 是否被 Zampto 封锁，或尝试更换一个代理节点。")
-        
+        if "cloudflare" in resp.text.lower() or "redirecting" in resp.text.lower():
+            print("⚠️ 依然被 WAF 拦截。请确认 Zampto 的登录路径是否为 /login，或尝试更换代理节点。")
         return False
     
     csrf_token = csrf_input.get('value')
@@ -118,7 +115,6 @@ def login(session):
     }
     
     try:
-        # allow_redirects=False 防止登录成功后立即重定向导致无法判断状态
         resp = session.post(login_url, data=login_data, proxies=PROXIES, timeout=30, allow_redirects=False)
         
         if resp.status_code in [301, 302]:
@@ -170,7 +166,6 @@ def start_server(session, server_id):
     start_url = f"{BASE_URL}/server/{server_id}/start"
     
     try:
-        # 先访问服务器页面获取 CSRF token
         resp = session.get(f"{BASE_URL}/server/{server_id}", proxies=PROXIES, timeout=30)
         resp.raise_for_status()
         
@@ -182,7 +177,6 @@ def start_server(session, server_id):
         
         csrf_token = csrf_input.get('value')
         
-        # 提交启动请求
         resp = session.post(start_url, data={'_token': csrf_token}, proxies=PROXIES, timeout=60)
         
         if resp.status_code == 200:
@@ -204,7 +198,6 @@ def stop_server(session, server_id):
     
     try:
         resp = session.get(stop_url, proxies=PROXIES, timeout=30)
-        
         if resp.status_code == 200:
             print(f"✅ 服务器 {server_id} 已停止")
             return True
@@ -219,12 +212,8 @@ def stop_server(session, server_id):
 def restart_server(session, server_id):
     """重启服务器"""
     print(f"🔄 正在重启服务器: {server_id}")
-    
-    # 先停止
     stop_server(session, server_id)
     time.sleep(5)
-    
-    # 再启动
     return start_server(session, server_id)
 
 
@@ -235,29 +224,24 @@ def main():
     print("🎮 Zampto Auto Script")
     print("=" * 50)
     
-    # 检查配置
     if not ZAMPTO_USERNAME or not ZAMPTO_PASSWORD:
         print("❌ 缺少 Zampto 账号配置")
         sys.exit(1)
     
-    # 检查代理
     if not check_proxy():
         send_wxpusher("❌ Zampto 代理失败", "代理检查失败，请检查 V2RAY_CONFIG 配置")
         sys.exit(1)
     
-    # 创建会话
-    session = requests.Session()
+    # 💡 核心修改：创建 Session 时指定 impersonate="chrome124"，完美模拟真实浏览器指纹
+    session = requests.Session(impersonate="chrome124")
     
-    # 登录
     if not login(session):
-        send_wxpusher("❌ Zampto 登录失败", f"账号: {ZAMPTO_USERNAME}\n请查看日志中的'页面内容片段'以排查原因。")
+        send_wxpusher("❌ Zampto 登录失败", f"账号: {ZAMPTO_USERNAME}\n请查看日志排查 WAF 拦截原因。")
         sys.exit(1)
     
-    # 判断运行模式
     start_only = "--start-only" in sys.argv
     
     if start_only:
-        # 仅启动模式
         if not ZAMPTO_SERVER_ID:
             print("❌ 缺少 ZAMPTO_SERVER_ID 配置")
             sys.exit(1)
@@ -268,7 +252,6 @@ def main():
         else:
             send_wxpusher("❌ Zampto 启动失败", f"服务器 ID: {ZAMPTO_SERVER_ID}")
     else:
-        # 完整模式：获取服务器列表并重启
         servers = get_servers(session)
         
         if not servers:
@@ -282,7 +265,6 @@ def main():
             else:
                 send_wxpusher("⚠️ Zampto 无服务器", "未找到任何服务器")
         else:
-            # 重启所有服务器
             success_count = 0
             for server in servers:
                 if restart_server(session, server['id']):
