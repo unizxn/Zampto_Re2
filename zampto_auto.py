@@ -4,7 +4,6 @@
 import os
 import sys
 import time
-import json
 import requests
 from bs4 import BeautifulSoup
 
@@ -78,7 +77,13 @@ def login(session):
     """登录 Zampto"""
     print(f"🔐 正在登录: {ZAMPTO_USERNAME}")
     
-    # 访问登录页面获取 CSRF token
+    # 【新增】伪装成真实浏览器，防止被基础反爬虫/WAF拦截
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7'
+    })
+    
     login_url = f"{BASE_URL}/login"
     try:
         resp = session.get(login_url, proxies=PROXIES, timeout=30)
@@ -90,8 +95,17 @@ def login(session):
     # 解析 CSRF token
     soup = BeautifulSoup(resp.text, 'html.parser')
     csrf_input = soup.find('input', {'name': '_token'})
+    
     if not csrf_input:
         print("❌ 未找到 CSRF token")
+        print(f"⚠️ HTTP 状态码: {resp.status_code}")
+        print(f"⚠️ 页面内容片段 (前 400 字符): \n{resp.text[:400].strip()}")
+        
+        # 检查是否被 Cloudflare 等 WAF 拦截
+        if "cloudflare" in resp.text.lower() or "checking your browser" in resp.text.lower() or "ddos" in resp.text.lower():
+            print("⚠️ 检测到可能被 Cloudflare 或 WAF 拦截！")
+            print("💡 建议：请检查你的 SOCKS 代理 IP 是否被 Zampto 封锁，或尝试更换一个代理节点。")
+        
         return False
     
     csrf_token = csrf_input.get('value')
@@ -104,6 +118,7 @@ def login(session):
     }
     
     try:
+        # allow_redirects=False 防止登录成功后立即重定向导致无法判断状态
         resp = session.post(login_url, data=login_data, proxies=PROXIES, timeout=30, allow_redirects=False)
         
         if resp.status_code in [301, 302]:
@@ -111,6 +126,7 @@ def login(session):
             return True
         else:
             print(f"❌ 登录失败: HTTP {resp.status_code}")
+            print(f"⚠️ 响应片段: {resp.text[:200]}")
             return False
     except Exception as e:
         print(f"❌ 登录请求异常: {e}")
@@ -161,7 +177,7 @@ def start_server(session, server_id):
         soup = BeautifulSoup(resp.text, 'html.parser')
         csrf_input = soup.find('input', {'name': '_token'})
         if not csrf_input:
-            print("❌ 未找到 CSRF token")
+            print("❌ 未找到 CSRF token (启动页面)")
             return False
         
         csrf_token = csrf_input.get('value')
@@ -234,7 +250,7 @@ def main():
     
     # 登录
     if not login(session):
-        send_wxpusher("❌ Zampto 登录失败", f"账号: {ZAMPTO_USERNAME}")
+        send_wxpusher("❌ Zampto 登录失败", f"账号: {ZAMPTO_USERNAME}\n请查看日志中的'页面内容片段'以排查原因。")
         sys.exit(1)
     
     # 判断运行模式
