@@ -21,8 +21,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 核心修改：使用 curl_cffi 替代 requests，完美模拟浏览器指纹绕过 WAF
-          pip install curl_cffi beautifulsoup4
+          # 核心修改：安装 requests(socks)、beautifulsoup4、playwright 和 stealth 插件
+          pip install "requests[socks]" beautifulsoup4 playwright playwright-stealth
+          # 安装 Chromium 浏览器及其系统依赖（GitHub Actions 必须执行这一步）
+          playwright install --with-deps chromium
 
       - name: 下载并启动 Xray 代理
         env:
