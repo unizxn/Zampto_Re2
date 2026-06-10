@@ -8,7 +8,6 @@ import requests
 from requests.cookies import RequestsCookieJar
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 # ==================== 配置区 ====================
 
@@ -57,12 +56,22 @@ def login_and_get_cookies():
     """使用 Playwright 模拟真实浏览器登录，绕过 Cloudflare 并提取 Cookie"""
     print(f"🔐 正在启动 Playwright 浏览器并绕过 Cloudflare...")
     
+    #  核心反检测 JS 脚本：隐藏自动化特征，绕过基础 WAF/Cloudflare 检测
+    stealth_js = """
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        window.chrome = {runtime: {}};
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+    """
+    
     try:
         with sync_playwright() as p:
             # 启动 Chromium，配置 SOCKS5 代理
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": PROXY_SERVER}
+                proxy={"server": PROXY_SERVER},
+                args=['--disable-blink-features=AutomationControlled'] # 禁用自动化控制特征
             )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -70,8 +79,8 @@ def login_and_get_cookies():
             )
             page = context.new_page()
             
-            # 应用 stealth 补丁，隐藏自动化特征
-            stealth_sync(page)
+            # 💡 注入反检测 JS 脚本 (替代 playwright_stealth 库)
+            page.add_init_script(stealth_js)
 
             # 访问登录页
             page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded")
@@ -89,8 +98,7 @@ def login_and_get_cookies():
             page.fill('input[name="email"]', ZAMPTO_USERNAME)
             page.fill('input[name="password"]', ZAMPTO_PASSWORD)
             
-            # 提交登录 (点击提交按钮或按回车)
-            # 尝试多种可能的登录按钮选择器
+            # 提交登录
             submit_clicked = False
             for selector in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Login")', 'button:has-text("登录")']:
                 try:
@@ -106,7 +114,7 @@ def login_and_get_cookies():
             # 等待登录成功后的页面加载
             page.wait_for_load_state("networkidle", timeout=15000)
             
-            # 检查是否登录成功（通过判断是否还在登录页）
+            # 检查是否登录成功
             if "login" in page.url.lower():
                 print("❌ 登录失败，账号或密码错误，或仍停留在登录页")
                 browser.close()
@@ -125,7 +133,7 @@ def login_and_get_cookies():
             return cookie_jar
 
     except Exception as e:
-        print(f"❌ Playwright 运行异常: {e}")
+        print(f" Playwright 运行异常: {e}")
         return None
 
 
@@ -152,7 +160,6 @@ def get_servers(session):
 def start_server(session, server_id):
     print(f"🚀 正在启动服务器: {server_id}")
     try:
-        # 获取启动页面的 CSRF token
         resp = session.get(f"{BASE_URL}/server/{server_id}", proxies=PROXIES, timeout=30)
         resp.raise_for_status()
         
@@ -162,7 +169,6 @@ def start_server(session, server_id):
             print("❌ 未找到 CSRF token (可能未登录或页面结构变更)")
             return False
         
-        # 提交启动请求
         resp = session.post(
             f"{BASE_URL}/server/{server_id}/start", 
             data={'_token': csrf_input.get('value')}, 
@@ -204,7 +210,7 @@ def restart_server(session, server_id):
 
 def main():
     print("=" * 50)
-    print("🎮 Zampto Auto Script (Playwright 版)")
+    print("🎮 Zampto Auto Script (Playwright 原生版)")
     print("=" * 50)
     
     if not ZAMPTO_USERNAME or not ZAMPTO_PASSWORD:
@@ -212,7 +218,7 @@ def main():
         sys.exit(1)
     
     if not check_proxy():
-        send_wxpusher("❌ Zampto 代理失败", "代理检查失败")
+        send_wxpusher(" Zampto 代理失败", "代理检查失败")
         sys.exit(1)
     
     # 1. 使用 Playwright 登录并获取 Cookie
