@@ -4,180 +4,171 @@
 import os
 import sys
 import time
-from curl_cffi import requests
+import requests
+from requests.cookies import RequestsCookieJar
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 # ==================== 配置区 ====================
 
-# 代理配置（Xray 本地 SOCKS5 端口）
 PROXY_SERVER = "socks5://127.0.0.1:1080"
 PROXIES = {
     "http": PROXY_SERVER,
     "https": PROXY_SERVER
 }
 
-# Zampto 配置（从环境变量读取）
 ZAMPTO_USERNAME = os.getenv("ZAMPTO_USERNAME")
 ZAMPTO_PASSWORD = os.getenv("ZAMPTO_PASSWORD")
 ZAMPTO_SERVER_ID = os.getenv("ZAMPTO_SERVER_ID")
 
-# WxPusher 配置（从环境变量读取，可选）
 WXPUSHER_TOKEN = os.getenv("WXPUSHER_TOKEN")
 WXPUSHER_UID = os.getenv("WXPUSHER_UID")
 
-# Zampto 基础 URL
 BASE_URL = "https://zampto.com"
 
 # ==================== 工具函数 ====================
 
 def send_wxpusher(title, content):
-    """发送 WxPusher 通知"""
     if not WXPUSHER_TOKEN or not WXPUSHER_UID:
-        print("WxPusher 未配置，跳过通知")
         return
-    
     url = "http://wxpusher.zjiecode.com/api/send/message"
     data = {
-        "appToken": WXPUSHER_TOKEN,
-        "content": content,
-        "summary": title,
-        "contentType": 1,
-        "uids": [WXPUSHER_UID]
+        "appToken": WXPUSHER_TOKEN, "content": content, "summary": title,
+        "contentType": 1, "uids": [WXPUSHER_UID]
     }
-    
     try:
-        # 通知接口通常不需要强指纹，使用普通 requests 即可，若失败可忽略
-        import requests as std_requests
-        resp = std_requests.post(url, json=data, timeout=10)
-        if resp.status_code == 200:
-            result = resp.json()
-            if result.get("code") == 1000:
-                print(f"✅ WxPusher 通知发送成功: {title}")
-            else:
-                print(f"❌ WxPusher 通知失败: {result.get('msg')}")
-    except Exception as e:
-        print(f"❌ WxPusher 异常: {e}")
-
+        requests.post(url, json=data, timeout=10)
+    except Exception:
+        pass
 
 def check_proxy():
-    """检查代理是否正常工作"""
     try:
-        # 使用 curl_cffi 模拟浏览器检查代理
-        resp = requests.get("https://ifconfig.me", proxies=PROXIES, timeout=10, impersonate="chrome124")
-        ip = resp.text.strip()
-        print(f"✅ 代理正常，出口 IP: {ip}")
+        resp = requests.get("https://ifconfig.me", proxies=PROXIES, timeout=10)
+        print(f"✅ 代理正常，出口 IP: {resp.text.strip()}")
         return True
     except Exception as e:
         print(f"❌ 代理检查失败: {e}")
         return False
 
-
 # ==================== 核心功能 ====================
 
-def login(session):
-    """登录 Zampto"""
-    print(f"🔐 正在登录: {ZAMPTO_USERNAME}")
+def login_and_get_cookies():
+    """使用 Playwright 模拟真实浏览器登录，绕过 Cloudflare 并提取 Cookie"""
+    print(f"🔐 正在启动 Playwright 浏览器并绕过 Cloudflare...")
     
-    # 💡 核心技巧：先访问一次首页，让 WAF 下发正常的初始 Cookie，大幅降低被拦截概率
     try:
-        session.get(f"{BASE_URL}/", proxies=PROXIES, timeout=30)
-    except Exception:
-        pass # 忽略首页访问错误，继续尝试登录页
-    
-    login_url = f"{BASE_URL}/login"
-    try:
-        resp = session.get(login_url, proxies=PROXIES, timeout=30)
-        resp.raise_for_status()
+        with sync_playwright() as p:
+            # 启动 Chromium，配置 SOCKS5 代理
+            browser = p.chromium.launch(
+                headless=True,
+                proxy={"server": PROXY_SERVER}
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
+            
+            # 应用 stealth 补丁，隐藏自动化特征
+            stealth_sync(page)
+
+            # 访问登录页
+            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded")
+            
+            # 等待 Cloudflare 挑战完成，出现登录表单的 email 输入框 (最多等 20 秒)
+            try:
+                page.wait_for_selector('input[name="email"]', timeout=20000)
+                print("✅ Cloudflare 验证通过，找到登录表单")
+            except Exception:
+                print(f"❌ 等待登录表单超时，可能被 CF 拦截。当前页面标题: {page.title()}")
+                browser.close()
+                return None
+
+            # 填写账号密码
+            page.fill('input[name="email"]', ZAMPTO_USERNAME)
+            page.fill('input[name="password"]', ZAMPTO_PASSWORD)
+            
+            # 提交登录 (点击提交按钮或按回车)
+            # 尝试多种可能的登录按钮选择器
+            submit_clicked = False
+            for selector in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("Login")', 'button:has-text("登录")']:
+                try:
+                    page.click(selector, timeout=2000)
+                    submit_clicked = True
+                    break
+                except Exception:
+                    continue
+            
+            if not submit_clicked:
+                page.keyboard.press('Enter')
+
+            # 等待登录成功后的页面加载
+            page.wait_for_load_state("networkidle", timeout=15000)
+            
+            # 检查是否登录成功（通过判断是否还在登录页）
+            if "login" in page.url.lower():
+                print("❌ 登录失败，账号或密码错误，或仍停留在登录页")
+                browser.close()
+                return None
+
+            # 提取所有 Cookie
+            cookies = context.cookies()
+            browser.close()
+            
+            # 将 Playwright 的 Cookie 转换为 requests 可用的 CookieJar
+            cookie_jar = RequestsCookieJar()
+            for cookie in cookies:
+                cookie_jar.set(cookie['name'], cookie['value'], domain=cookie.get('domain', ''), path=cookie.get('path', '/'))
+                
+            print("✅ 登录成功并提取 Cookie")
+            return cookie_jar
+
     except Exception as e:
-        print(f"❌ 访问登录页面失败: {e}")
-        return False
-    
-    # 解析 CSRF token
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    csrf_input = soup.find('input', {'name': '_token'})
-    
-    if not csrf_input:
-        print("❌ 未找到 CSRF token")
-        print(f"⚠️ HTTP 状态码: {resp.status_code}")
-        print(f"⚠️ 页面内容片段 (前 500 字符): \n{resp.text[:500].strip()}")
-        
-        if "cloudflare" in resp.text.lower() or "redirecting" in resp.text.lower():
-            print("⚠️ 依然被 WAF 拦截。请确认 Zampto 的登录路径是否为 /login，或尝试更换代理节点。")
-        return False
-    
-    csrf_token = csrf_input.get('value')
-    
-    # 提交登录
-    login_data = {
-        '_token': csrf_token,
-        'email': ZAMPTO_USERNAME,
-        'password': ZAMPTO_PASSWORD
-    }
-    
-    try:
-        resp = session.post(login_url, data=login_data, proxies=PROXIES, timeout=30, allow_redirects=False)
-        
-        if resp.status_code in [301, 302]:
-            print("✅ 登录成功")
-            return True
-        else:
-            print(f"❌ 登录失败: HTTP {resp.status_code}")
-            print(f"⚠️ 响应片段: {resp.text[:200]}")
-            return False
-    except Exception as e:
-        print(f"❌ 登录请求异常: {e}")
-        return False
+        print(f"❌ Playwright 运行异常: {e}")
+        return None
 
 
 def get_servers(session):
-    """获取服务器列表"""
     print("📡 正在获取服务器列表...")
-    
-    servers_url = f"{BASE_URL}/servers"
     try:
-        resp = session.get(servers_url, proxies=PROXIES, timeout=30)
+        resp = session.get(f"{BASE_URL}/servers", proxies=PROXIES, timeout=30)
         resp.raise_for_status()
     except Exception as e:
         print(f"❌ 获取服务器列表失败: {e}")
         return []
     
     soup = BeautifulSoup(resp.text, 'html.parser')
-    server_rows = soup.find_all('tr')
-    
     servers = []
-    for row in server_rows:
+    for row in soup.find_all('tr'):
         cells = row.find_all('td')
         if len(cells) >= 2:
-            server_id = cells[0].get_text(strip=True)
-            server_name = cells[1].get_text(strip=True)
-            servers.append({
-                'id': server_id,
-                'name': server_name
-            })
+            servers.append({'id': cells[0].get_text(strip=True), 'name': cells[1].get_text(strip=True)})
     
     print(f"✅ 找到 {len(servers)} 个服务器")
     return servers
 
 
 def start_server(session, server_id):
-    """启动指定服务器"""
     print(f"🚀 正在启动服务器: {server_id}")
-    
-    start_url = f"{BASE_URL}/server/{server_id}/start"
-    
     try:
+        # 获取启动页面的 CSRF token
         resp = session.get(f"{BASE_URL}/server/{server_id}", proxies=PROXIES, timeout=30)
         resp.raise_for_status()
         
         soup = BeautifulSoup(resp.text, 'html.parser')
         csrf_input = soup.find('input', {'name': '_token'})
         if not csrf_input:
-            print("❌ 未找到 CSRF token (启动页面)")
+            print("❌ 未找到 CSRF token (可能未登录或页面结构变更)")
             return False
         
-        csrf_token = csrf_input.get('value')
-        
-        resp = session.post(start_url, data={'_token': csrf_token}, proxies=PROXIES, timeout=60)
+        # 提交启动请求
+        resp = session.post(
+            f"{BASE_URL}/server/{server_id}/start", 
+            data={'_token': csrf_input.get('value')}, 
+            proxies=PROXIES, 
+            timeout=60
+        )
         
         if resp.status_code == 200:
             print(f"✅ 服务器 {server_id} 启动成功")
@@ -191,27 +182,19 @@ def start_server(session, server_id):
 
 
 def stop_server(session, server_id):
-    """停止指定服务器"""
     print(f"🛑 正在停止服务器: {server_id}")
-    
-    stop_url = f"{BASE_URL}/server/{server_id}/stop"
-    
     try:
-        resp = session.get(stop_url, proxies=PROXIES, timeout=30)
+        resp = session.get(f"{BASE_URL}/server/{server_id}/stop", proxies=PROXIES, timeout=30)
         if resp.status_code == 200:
             print(f"✅ 服务器 {server_id} 已停止")
             return True
-        else:
-            print(f"❌ 停止服务器失败: HTTP {resp.status_code}")
-            return False
     except Exception as e:
         print(f"❌ 停止服务器异常: {e}")
-        return False
+    return False
 
 
 def restart_server(session, server_id):
-    """重启服务器"""
-    print(f"🔄 正在重启服务器: {server_id}")
+    print(f" 正在重启服务器: {server_id}")
     stop_server(session, server_id)
     time.sleep(5)
     return start_server(session, server_id)
@@ -221,31 +204,34 @@ def restart_server(session, server_id):
 
 def main():
     print("=" * 50)
-    print("🎮 Zampto Auto Script")
+    print("🎮 Zampto Auto Script (Playwright 版)")
     print("=" * 50)
     
     if not ZAMPTO_USERNAME or not ZAMPTO_PASSWORD:
-        print("❌ 缺少 Zampto 账号配置")
+        print(" 缺少 Zampto 账号配置")
         sys.exit(1)
     
     if not check_proxy():
-        send_wxpusher("❌ Zampto 代理失败", "代理检查失败，请检查 V2RAY_CONFIG 配置")
+        send_wxpusher("❌ Zampto 代理失败", "代理检查失败")
         sys.exit(1)
     
-    # 💡 核心修改：创建 Session 时指定 impersonate="chrome124"，完美模拟真实浏览器指纹
-    session = requests.Session(impersonate="chrome124")
-    
-    if not login(session):
-        send_wxpusher("❌ Zampto 登录失败", f"账号: {ZAMPTO_USERNAME}\n请查看日志排查 WAF 拦截原因。")
+    # 1. 使用 Playwright 登录并获取 Cookie
+    cookie_jar = login_and_get_cookies()
+    if not cookie_jar:
+        send_wxpusher("❌ Zampto 登录失败", f"账号: {ZAMPTO_USERNAME}\n请检查日志排查 Cloudflare 拦截原因。")
         sys.exit(1)
     
+    # 2. 创建 requests session 并注入 Cookie
+    session = requests.Session()
+    session.cookies.update(cookie_jar)
+    
+    # 3. 执行后续操作
     start_only = "--start-only" in sys.argv
     
     if start_only:
         if not ZAMPTO_SERVER_ID:
             print("❌ 缺少 ZAMPTO_SERVER_ID 配置")
             sys.exit(1)
-        
         success = start_server(session, ZAMPTO_SERVER_ID)
         if success:
             send_wxpusher("✅ Zampto 服务器已启动", f"服务器 ID: {ZAMPTO_SERVER_ID}")
@@ -253,9 +239,7 @@ def main():
             send_wxpusher("❌ Zampto 启动失败", f"服务器 ID: {ZAMPTO_SERVER_ID}")
     else:
         servers = get_servers(session)
-        
         if not servers:
-            print("⚠️ 未找到服务器，尝试启动指定服务器")
             if ZAMPTO_SERVER_ID:
                 success = restart_server(session, ZAMPTO_SERVER_ID)
                 if success:
@@ -270,14 +254,11 @@ def main():
                 if restart_server(session, server['id']):
                     success_count += 1
                 time.sleep(3)
-            
-            msg = f"成功重启 {success_count}/{len(servers)} 个服务器"
-            send_wxpusher("✅ Zampto 自动重启完成", msg)
+            send_wxpusher("✅ Zampto 自动重启完成", f"成功重启 {success_count}/{len(servers)} 个服务器")
     
     print("=" * 50)
     print("✅ 任务完成")
     print("=" * 50)
-
 
 if __name__ == "__main__":
     main()
